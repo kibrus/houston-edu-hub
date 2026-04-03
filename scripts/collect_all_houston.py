@@ -1,26 +1,40 @@
 """
-Houston Area College Data Collector
+Houston Edu Hub — Collect All Houston Institutions
 Pulls all institutions within 75mi of Houston (ZIP 77002)
-for years 2018-2023 from the College Scorecard API.
-Output: data/raw/houston_colleges_all.xlsx
+for years 2018-2023 from the College Scorecard API
+and loads them into Supabase (houston_all schema).
+
+Auto-update logic:
+  - On first run: loads all years (2018-2023)
+  - On subsequent runs: only fetches the latest year if not already in DB
+  - Run this script once a year to keep data current
+
+Tables:
+    houston_all.all_colleges
+    houston_all.all_college_metrics
+    houston_all.all_college_diversity
 """
 
-import requests
 import os
-import pandas as pd
+import sys
+import math
+import requests
 import time
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
+from datetime import datetime
 
-API_KEY     = "B2H5JoCRV54pApGF5FLvirwG3KQesLk8lilyOqts"
-BASE_URL    = "https://api.data.gov/ed/collegescorecard/v1/schools"
-YEARS       = [2018, 2019, 2020, 2021, 2022, 2023]
-HOUSTON_ZIP = "77002"
-RADIUS      = "75mi"
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import SUPABASE_URL, SUPABASE_KEY
+from supabase import create_client
 
-# Schools outside the 75mi radius that must be included manually
+API_KEY       = "B2H5JoCRV54pApGF5FLvirwG3KQesLk8lilyOqts"
+BASE_URL      = "https://api.data.gov/ed/collegescorecard/v1/schools"
+ALL_YEARS     = [2018, 2019, 2020, 2021, 2022, 2023]
+HOUSTON_ZIP   = "77002"
+RADIUS        = "75mi"
 EXTRA_SCHOOLS = ["University of Houston-Victoria"]
+SCHEMA        = "houston_all"
+
+client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 OWNERSHIP_MAP = {1: "Public", 2: "Private Nonprofit", 3: "Private For-Profit"}
 DEGREE_MAP    = {0: "Not classified", 1: "Certificate", 2: "Associate's", 3: "Bachelor's", 4: "Graduate"}
@@ -59,6 +73,7 @@ STATIC_FIELDS = [
     "school.women_only", "school.men_only",
     "school.religious_affiliation", "school.carnegie_size_setting",
     "school.locale", "school.under_investigation",
+    "school.school_url",
 ]
 
 METRIC_FIELD_TEMPLATES = [
@@ -79,10 +94,10 @@ METRIC_FIELD_TEMPLATES = [
     "{year}.repayment.3_yr_default_rate",
     "{year}.aid.pell_grant_rate",
     "{year}.aid.federal_loan_rate",
-    "{year}.completion.outcome_percentage_suppressed.full_time.first_time.8yr.award_pooled",
-    "{year}.completion.outcome_percentage_suppressed.full_time.first_time.8yr.transfer_pooled",
-    "{year}.completion.outcome_percentage_suppressed.full_time.first_time.8yr.unknown_pooled",
-    "{year}.completion.outcome_percentage_suppressed.full_time.first_time.8yr.still_enrolled_pooled",
+    "{year}.completion.outcome_percentage_suppressed.all_students.8yr.award_pooled",
+    "{year}.completion.outcome_percentage_suppressed.all_students.8yr.transfer_pooled",
+    "{year}.completion.outcome_percentage_suppressed.all_students.8yr.unknown_pooled",
+    "{year}.completion.outcome_percentage_suppressed.all_students.8yr.still_enrolled_pooled",
     "{year}.admissions.sat_scores.25th_percentile.critical_reading",
     "{year}.admissions.sat_scores.75th_percentile.critical_reading",
     "{year}.admissions.sat_scores.25th_percentile.math",
@@ -122,15 +137,51 @@ def build_fields(year):
     )
 
 
+def get_years_in_db():
+    """Returns the set of years already loaded in the database."""
+    try:
+        result = client.schema(SCHEMA).table("all_college_metrics").select("year").execute()
+        return set(row["year"] for row in result.data)
+    except Exception:
+        return set()
+
+
+def get_years_to_fetch():
+    """
+    Determines which years to fetch.
+    - First run: fetches all years
+    - Subsequent runs: only fetches years not already in DB
+      plus the latest year to refresh it with new data
+    """
+    years_in_db  = get_years_in_db()
+    current_year = datetime.now().year
+    latest_api_year = max(ALL_YEARS)
+
+    if not years_in_db:
+        print("First run — fetching all years.")
+        return ALL_YEARS
+
+    missing_years = [y for y in ALL_YEARS if y not in years_in_db]
+
+    # Always re-fetch the latest year in case new data was released
+    years_to_fetch = list(set(missing_years + [latest_api_year]))
+    years_to_fetch.sort()
+
+    if years_to_fetch == [latest_api_year]:
+        print(f"Database is up to date. Refreshing latest year ({latest_api_year}).")
+    else:
+        print(f"Fetching missing years + latest refresh: {years_to_fetch}")
+
+    return years_to_fetch
+
+
 def fetch_schools(year):
     params = {
         "api_key": API_KEY, "zip": HOUSTON_ZIP, "distance": RADIUS,
         "fields": ",".join(build_fields(year)), "per_page": 100, "page": 0,
     }
-
     all_results, total_fetched = [], 0
-    print(f"Fetching {year}...", end=" ", flush=True)
-
+    print(f"  Fetching {year}...", end=" ", flush=True)
     while True:
         resp = requests.get(BASE_URL, params=params, timeout=30)
         if resp.status_code != 200:
@@ -147,190 +198,169 @@ def fetch_schools(year):
             break
         params["page"] += 1
         time.sleep(0.3)
-
     print(f"{total_fetched} schools")
     return all_results
 
 
-def fetch_school_by_name(name, year):
+def fetch_by_name(name, year):
     params = {
-        "api_key":     API_KEY,
-        "school.name": name,
-        "fields":      ",".join(build_fields(year)),
-        "per_page":    1,
+        "api_key": API_KEY, "school.name": name,
+        "fields": ",".join(build_fields(year)), "per_page": 1,
     }
     resp    = requests.get(BASE_URL, params=params, timeout=30)
     results = resp.json().get("results", []) if resp.status_code == 200 else []
     if not results:
-        print(f"Warning: could not find '{name}' for year {year}")
+        print(f"  Warning: could not find '{name}' for {year}")
     return results
 
 
-def build_table1(all_records_by_year):
-    latest_year = max(all_records_by_year.keys())
-    rows = []
-
-    for r in all_records_by_year[latest_year]:
-        missions = [label for field, label in MISSION_MAP.items() if r.get(field) == 1]
-        if not missions:
-            specialized = "None"
-        elif len(missions) == 1:
-            specialized = missions[0]
-        else:
-            specialized = ", ".join(missions)
-
-        pred    = DEGREE_MAP.get(r.get("school.degrees_awarded.predominant", 0), "")
-        highest = DEGREE_MAP.get(r.get("school.degrees_awarded.highest", 0), "")
-        awards  = pred if pred == highest else (f"{pred}, {highest}" if pred and highest else pred or highest)
-
-        rows.append({
-            "College_ID":            r.get("id"),
-            "College_Name":          r.get("school.name"),
-            "City":                  r.get("school.city"),
-            "State":                 r.get("school.state"),
-            "Ownership":             OWNERSHIP_MAP.get(r.get("school.ownership"), "Unknown"),
-            "Predominant_Degree":    DEGREE_MAP.get(r.get("school.degrees_awarded.predominant"), "Unknown"),
-            "Awards_Offered":        awards,
-            "Latitude":              r.get("location.lat"),
-            "Longitude":             r.get("location.lon"),
-            "Specialized_Mission":   specialized,
-            "Religious_Affiliation": RELIGIOUS_MAP.get(r.get("school.religious_affiliation", -1), "Not Affiliated"),
-            "WIOA_Programs":         "Yes" if r.get("school.under_investigation") == 1 else "No",
-            "Size":                  SIZE_MAP.get(r.get("school.carnegie_size_setting"), "Unknown"),
-            "Urbanicity":            LOCALE_MAP.get(r.get("school.locale"), "Unknown"),
-        })
-
-    df = pd.DataFrame(rows).drop_duplicates("College_ID").sort_values("College_Name").reset_index(drop=True)
-    df["Specialized_Mission"] = df["Specialized_Mission"].fillna("None")
-    return df
+def clean(v):
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    return v
 
 
-def build_table2(all_records_by_year):
-    rows = []
-    for year, records in all_records_by_year.items():
-        yr = str(year)
-        for r in records:
-            pt_share = r.get(f"{yr}.student.part_time_share")
-            ft_pct   = round(1 - pt_share, 4) if pt_share is not None else None
-            pt_pct   = round(pt_share, 4)      if pt_share is not None else None
-
-            rows.append({
-                "College_ID":               r.get("id"),
-                "Year":                     year,
-                "In_State_Tuition":         r.get(f"{yr}.cost.tuition.in_state"),
-                "Out_State_Tuition":        r.get(f"{yr}.cost.tuition.out_of_state"),
-                "Net_Annual_Cost":          r.get(f"{yr}.cost.avg_net_price.overall"),
-                "Acceptance_Rate":          r.get(f"{yr}.admissions.admission_rate.overall"),
-                "Graduation_Rate":          r.get(f"{yr}.completion.rate_suppressed.overall"),
-                "Retention_Rate":           (r.get(f"{yr}.student.retention_rate.four_year.full_time")
-                                             or r.get(f"{yr}.student.retention_rate.lt_four_year.full_time")),
-                "Enrollment":               r.get(f"{yr}.student.size"),
-                "FullTime_Pct":             ft_pct,
-                "PartTime_Pct":             pt_pct,
-                "Student_Faculty_Ratio":    r.get(f"{yr}.student.demographics.student_faculty_ratio"),
-                "Median_Earnings":          r.get(f"{yr}.earnings.10_yrs_after_entry.median"),
-                "Pct_Earning_More_Than_HS": r.get(f"{yr}.earnings.10_yrs_after_entry.gt_threshold"),
-                "Median_Debt":              r.get(f"{yr}.aid.median_debt.completers.overall"),
-                "Monthly_Loan_Payment":     r.get(f"{yr}.aid.median_debt.completers.monthly_payments"),
-                "Loan_Default_Rate":        r.get(f"{yr}.repayment.3_yr_default_rate"),
-                "Pell_Grant_Pct":           r.get(f"{yr}.aid.pell_grant_rate"),
-                "Federal_Aid_Pct":          r.get(f"{yr}.aid.federal_loan_rate"),
-                "Outcome_Graduated_Pct":    r.get(f"{yr}.completion.outcome_percentage_suppressed.full_time.first_time.8yr.award_pooled"),
-                "Outcome_Transferred_Pct":  r.get(f"{yr}.completion.outcome_percentage_suppressed.full_time.first_time.8yr.transfer_pooled"),
-                "Outcome_Withdrew_Pct":     r.get(f"{yr}.completion.outcome_percentage_suppressed.full_time.first_time.8yr.unknown_pooled"),
-                "Outcome_Enrolled_Pct":     r.get(f"{yr}.completion.outcome_percentage_suppressed.full_time.first_time.8yr.still_enrolled_pooled"),
-                "SAT_Reading_25":           r.get(f"{yr}.admissions.sat_scores.25th_percentile.critical_reading"),
-                "SAT_Reading_75":           r.get(f"{yr}.admissions.sat_scores.75th_percentile.critical_reading"),
-                "SAT_Math_25":              r.get(f"{yr}.admissions.sat_scores.25th_percentile.math"),
-                "SAT_Math_75":              r.get(f"{yr}.admissions.sat_scores.75th_percentile.math"),
-                "ACT_25":                   r.get(f"{yr}.admissions.act_scores.25th_percentile.cumulative"),
-                "ACT_75":                   r.get(f"{yr}.admissions.act_scores.75th_percentile.cumulative"),
-            })
-
-    return pd.DataFrame(rows).sort_values(["College_ID", "Year"]).reset_index(drop=True)
+def build_college_record(r):
+    missions    = [label for field, label in MISSION_MAP.items() if r.get(field) == 1]
+    specialized = "None" if not missions else (missions[0] if len(missions) == 1 else ", ".join(missions))
+    pred        = DEGREE_MAP.get(r.get("school.degrees_awarded.predominant", 0), "")
+    highest     = DEGREE_MAP.get(r.get("school.degrees_awarded.highest", 0), "")
+    awards      = pred if pred == highest else (f"{pred}, {highest}" if pred and highest else pred or highest)
+    url         = r.get("school.school_url") or ""
+    if url and not url.startswith("http"):
+        url = "https://" + url
+    return {
+        "college_id":            r.get("id"),
+        "college_name":          r.get("school.name"),
+        "city":                  r.get("school.city"),
+        "state":                 r.get("school.state"),
+        "ownership":             OWNERSHIP_MAP.get(r.get("school.ownership"), "Unknown"),
+        "predominant_degree":    DEGREE_MAP.get(r.get("school.degrees_awarded.predominant"), "Unknown"),
+        "awards_offered":        awards,
+        "latitude":              r.get("location.lat"),
+        "longitude":             r.get("location.lon"),
+        "specialized_mission":   specialized,
+        "religious_affiliation": RELIGIOUS_MAP.get(r.get("school.religious_affiliation", -1), "Not Affiliated"),
+        "wioa_programs":         "Yes" if r.get("school.under_investigation") == 1 else "No",
+        "size":                  SIZE_MAP.get(r.get("school.carnegie_size_setting"), "Unknown"),
+        "urbanicity":            LOCALE_MAP.get(r.get("school.locale"), "Unknown"),
+        "website":               url or None,
+    }
 
 
-def build_table3(all_records_by_year):
-    rows = []
-    for year, records in all_records_by_year.items():
-        yr = str(year)
-        for r in records:
-            rows.append({
-                "College_ID":                   r.get("id"),
-                "Year":                         year,
-                "Hispanic_Student_Pct":         r.get(f"{yr}.student.demographics.race_ethnicity.hispanic"),
-                "Black_Student_Pct":            r.get(f"{yr}.student.demographics.race_ethnicity.black"),
-                "White_Student_Pct":            r.get(f"{yr}.student.demographics.race_ethnicity.white"),
-                "Asian_Student_Pct":            r.get(f"{yr}.student.demographics.race_ethnicity.asian"),
-                "NativeAmerican_Student_Pct":   r.get(f"{yr}.student.demographics.race_ethnicity.aian"),
-                "PacificIslander_Student_Pct":  r.get(f"{yr}.student.demographics.race_ethnicity.nhpi"),
-                "TwoPlus_Student_Pct":          r.get(f"{yr}.student.demographics.race_ethnicity.two_or_more"),
-                "NonResident_Student_Pct":      r.get(f"{yr}.student.demographics.race_ethnicity.non_resident_alien"),
-                "Unknown_Student_Pct":          r.get(f"{yr}.student.demographics.race_ethnicity.unknown"),
-                "Hispanic_Staff_Pct":           r.get(f"{yr}.student.demographics.faculty.race_ethnicity.hispanic"),
-                "Black_Staff_Pct":              r.get(f"{yr}.student.demographics.faculty.race_ethnicity.black"),
-                "White_Staff_Pct":              r.get(f"{yr}.student.demographics.faculty.race_ethnicity.white"),
-                "Asian_Staff_Pct":              r.get(f"{yr}.student.demographics.faculty.race_ethnicity.asian"),
-                "NativeAmerican_Staff_Pct":     r.get(f"{yr}.student.demographics.faculty.race_ethnicity.aian"),
-                "PacificIslander_Staff_Pct":    r.get(f"{yr}.student.demographics.faculty.race_ethnicity.nhpi"),
-                "TwoPlus_Staff_Pct":            r.get(f"{yr}.student.demographics.faculty.race_ethnicity.two_or_more"),
-                "NonResident_Staff_Pct":        r.get(f"{yr}.student.demographics.faculty.race_ethnicity.non_resident_alien"),
-                "Unknown_Staff_Pct":            r.get(f"{yr}.student.demographics.faculty.race_ethnicity.unknown"),
-            })
-
-    return pd.DataFrame(rows).sort_values(["College_ID", "Year"]).reset_index(drop=True)
-
-
-def format_sheet(ws, header_color="1F4E79"):
-    for cell in ws[1]:
-        cell.font      = Font(bold=True, color="FFFFFF", size=10)
-        cell.fill      = PatternFill("solid", start_color=header_color)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[1].height = 28
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for cell in row:
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-    for col_idx, col in enumerate(ws.columns, 1):
-        max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 35)
-    ws.freeze_panes = "A2"
+def build_metric_record(r, year):
+    yr       = str(year)
+    pt_share = r.get(f"{yr}.student.part_time_share")
+    ft_pct   = round(1 - pt_share, 4) if pt_share is not None else None
+    pt_pct   = round(pt_share, 4)      if pt_share is not None else None
+    return {
+        "college_id":               r.get("id"),
+        "year":                     year,
+        "in_state_tuition":         clean(r.get(f"{yr}.cost.tuition.in_state")),
+        "out_state_tuition":        clean(r.get(f"{yr}.cost.tuition.out_of_state")),
+        "net_annual_cost":          clean(r.get(f"{yr}.cost.avg_net_price.overall")),
+        "acceptance_rate":          clean(r.get(f"{yr}.admissions.admission_rate.overall")),
+        "graduation_rate":          clean(r.get(f"{yr}.completion.rate_suppressed.overall")),
+        "retention_rate":           clean(r.get(f"{yr}.student.retention_rate.four_year.full_time")
+                                         or r.get(f"{yr}.student.retention_rate.lt_four_year.full_time")),
+        "enrollment":               clean(r.get(f"{yr}.student.size")),
+        "fulltime_pct":             clean(ft_pct),
+        "parttime_pct":             clean(pt_pct),
+        "student_faculty_ratio":    clean(r.get(f"{yr}.student.demographics.student_faculty_ratio")),
+        "median_earnings":          clean(r.get(f"{yr}.earnings.10_yrs_after_entry.median")),
+        "pct_earning_more_than_hs": clean(r.get(f"{yr}.earnings.10_yrs_after_entry.gt_threshold")),
+        "median_debt":              clean(r.get(f"{yr}.aid.median_debt.completers.overall")),
+        "monthly_loan_payment":     clean(r.get(f"{yr}.aid.median_debt.completers.monthly_payments")),
+        "loan_default_rate":        clean(r.get(f"{yr}.repayment.3_yr_default_rate")),
+        "pell_grant_pct":           clean(r.get(f"{yr}.aid.pell_grant_rate")),
+        "federal_aid_pct":          clean(r.get(f"{yr}.aid.federal_loan_rate")),
+        "outcome_graduated_pct":    clean(r.get(f"{yr}.completion.outcome_percentage_suppressed.all_students.8yr.award_pooled")),
+        "outcome_transferred_pct":  clean(r.get(f"{yr}.completion.outcome_percentage_suppressed.all_students.8yr.transfer_pooled")),
+        "outcome_withdrew_pct":     clean(r.get(f"{yr}.completion.outcome_percentage_suppressed.all_students.8yr.unknown_pooled")),
+        "outcome_enrolled_pct":     clean(r.get(f"{yr}.completion.outcome_percentage_suppressed.all_students.8yr.still_enrolled_pooled")),
+        "sat_reading_25":           clean(r.get(f"{yr}.admissions.sat_scores.25th_percentile.critical_reading")),
+        "sat_reading_75":           clean(r.get(f"{yr}.admissions.sat_scores.75th_percentile.critical_reading")),
+        "sat_math_25":              clean(r.get(f"{yr}.admissions.sat_scores.25th_percentile.math")),
+        "sat_math_75":              clean(r.get(f"{yr}.admissions.sat_scores.75th_percentile.math")),
+        "act_25":                   clean(r.get(f"{yr}.admissions.act_scores.25th_percentile.cumulative")),
+        "act_75":                   clean(r.get(f"{yr}.admissions.act_scores.75th_percentile.cumulative")),
+    }
 
 
-def save_to_excel(t1, t2, t3, filepath):
-    with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
-        t1.to_excel(writer, sheet_name="Table1_Colleges",       index=False)
-        t2.to_excel(writer, sheet_name="Table2_Metrics_Yearly", index=False)
-        t3.to_excel(writer, sheet_name="Table3_Race_Diversity", index=False)
-    wb = load_workbook(filepath)
-    format_sheet(wb["Table1_Colleges"],       "1F4E79")
-    format_sheet(wb["Table2_Metrics_Yearly"], "375623")
-    format_sheet(wb["Table3_Race_Diversity"], "843C0C")
-    wb.save(filepath)
+def build_diversity_record(r, year):
+    yr = str(year)
+    return {
+        "college_id":                   r.get("id"),
+        "year":                         year,
+        "hispanic_student_pct":         clean(r.get(f"{yr}.student.demographics.race_ethnicity.hispanic")),
+        "black_student_pct":            clean(r.get(f"{yr}.student.demographics.race_ethnicity.black")),
+        "white_student_pct":            clean(r.get(f"{yr}.student.demographics.race_ethnicity.white")),
+        "asian_student_pct":            clean(r.get(f"{yr}.student.demographics.race_ethnicity.asian")),
+        "nativeamerican_student_pct":   clean(r.get(f"{yr}.student.demographics.race_ethnicity.aian")),
+        "pacificislander_student_pct":  clean(r.get(f"{yr}.student.demographics.race_ethnicity.nhpi")),
+        "twoplus_student_pct":          clean(r.get(f"{yr}.student.demographics.race_ethnicity.two_or_more")),
+        "nonresident_student_pct":      clean(r.get(f"{yr}.student.demographics.race_ethnicity.non_resident_alien")),
+        "unknown_student_pct":          clean(r.get(f"{yr}.student.demographics.race_ethnicity.unknown")),
+        "hispanic_staff_pct":           clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.hispanic")),
+        "black_staff_pct":              clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.black")),
+        "white_staff_pct":              clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.white")),
+        "asian_staff_pct":              clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.asian")),
+        "nativeamerican_staff_pct":     clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.aian")),
+        "pacificislander_staff_pct":    clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.nhpi")),
+        "twoplus_staff_pct":            clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.two_or_more")),
+        "nonresident_staff_pct":        clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.non_resident_alien")),
+        "unknown_staff_pct":            clean(r.get(f"{yr}.student.demographics.faculty.race_ethnicity.unknown")),
+    }
+
+
+def upsert_batch(table, records, batch_size=100):
+    for i in range(0, len(records), batch_size):
+        client.schema(SCHEMA).table(table).upsert(records[i:i+batch_size]).execute()
 
 
 if __name__ == "__main__":
-    print(f"Collecting Houston-area institutions ({YEARS[0]}-{YEARS[-1]})...\n")
+    print(f"Houston Edu Hub — Data Collector")
+    print(f"Schema: {SCHEMA}\n")
+
+    years_to_fetch = get_years_to_fetch()
 
     all_records_by_year = {}
-    for year in YEARS:
+    for year in years_to_fetch:
         records      = fetch_schools(year)
         existing_ids = {r.get("id") for r in records}
         for name in EXTRA_SCHOOLS:
-            for s in fetch_school_by_name(name, year):
+            for s in fetch_by_name(name, year):
                 if s.get("id") not in existing_ids:
                     records.append(s)
                     existing_ids.add(s.get("id"))
             time.sleep(0.3)
         all_records_by_year[year] = records
 
-    print("\nBuilding tables...")
-    t1 = build_table1(all_records_by_year)
-    t2 = build_table2(all_records_by_year)
-    t3 = build_table3(all_records_by_year)
+    latest_year    = max(all_records_by_year.keys())
+    latest_records = all_records_by_year[latest_year]
 
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    output_path  = os.path.join(project_root, "data", "raw", "houston_colleges_all.xlsx")
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    save_to_excel(t1, t2, t3, output_path)
+    print(f"\nLoading into Supabase ({SCHEMA} schema)...")
 
-    print(f"Done. {t1['College_ID'].nunique()} schools saved to data/raw/houston_colleges_all.xlsx")
+    print("  all_colleges...")
+    college_records = [build_college_record(r) for r in latest_records]
+    upsert_batch("all_colleges", college_records)
+    print(f"  {len(college_records)} schools.")
+
+    print("  all_college_metrics...")
+    metric_records = []
+    for year, records in all_records_by_year.items():
+        for r in records:
+            metric_records.append(build_metric_record(r, year))
+    upsert_batch("all_college_metrics", metric_records)
+    print(f"  {len(metric_records)} rows.")
+
+    print("  all_college_diversity...")
+    diversity_records = []
+    for year, records in all_records_by_year.items():
+        for r in records:
+            diversity_records.append(build_diversity_record(r, year))
+    upsert_batch("all_college_diversity", diversity_records)
+    print(f"  {len(diversity_records)} rows.")
+
+    print(f"\nDone. Years loaded: {sorted(all_records_by_year.keys())}")
+    print(f"Run this script again next year to add new data automatically.")
