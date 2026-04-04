@@ -1,137 +1,105 @@
 """
-Houston Edu Hub — Curated School Filter
-Filters the raw dataset to institutions offering Associate's,
-Bachelor's, or Graduate degrees (excludes certificate-only schools).
+Houston Edu Hub — Filter to Curated Schools
+Reads from houston_all schema, filters to Associate's, Bachelor's,
+and Graduate institutions, loads into public schema.
 
-Input:  data/raw/houston_colleges_all.xlsx
-Output: data/curated/houston_colleges_curated.xlsx
+Run from project root:
+    python scripts/filter_to_curated.py
 """
 
-import os
-import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-from openpyxl.utils import get_column_letter
+import os, sys, math
+from collections import Counter
 
-# Keep schools where predominant degree is Associate's, Bachelor's, or Graduate
-KEEP_DEGREES = ["Associate's", "Bachelor's", "Graduate"]
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import SUPABASE_URL, SUPABASE_KEY
+from supabase import create_client
 
-# Category labels based on ownership and degree
-def assign_category(row):
-    if row["Ownership"] == "Public" and row["Predominant_Degree"] == "Associate's":
+client        = create_client(SUPABASE_URL, SUPABASE_KEY)
+SOURCE_SCHEMA = "houston_all"
+KEEP_DEGREES  = ["Associate's", "Bachelor's", "Graduate"]
+
+
+def assign_category(school):
+    ownership = school.get("ownership", "")
+    degree    = school.get("predominant_degree", "")
+    if ownership == "Public" and degree == "Associate's":
         return "Community College"
-    elif row["Ownership"] == "Public":
+    elif ownership == "Public":
         return "Public University"
-    elif row["Ownership"] == "Private Nonprofit":
+    elif ownership == "Private Nonprofit":
         return "Private Nonprofit"
     else:
         return "Private For-Profit"
 
-CATEGORY_COLORS = {
-    "Public University":   "DDEEFF",
-    "Community College":   "DFF2D8",
-    "Private Nonprofit":   "FFF2CC",
-    "Private For-Profit":  "FCE4D6",
-}
+
+def clean(v):
+    if isinstance(v, float) and math.isnan(v):
+        return None
+    return v
 
 
-def load_tables(filepath):
-    t1 = pd.read_excel(filepath, sheet_name="Table1_Colleges")
-    t2 = pd.read_excel(filepath, sheet_name="Table2_Metrics_Yearly")
-    t3 = pd.read_excel(filepath, sheet_name="Table3_Race_Diversity")
-    return t1, t2, t3
+def get_years_in_target():
+    try:
+        result = client.table("college_metrics").select("year").execute()
+        return set(row["year"] for row in result.data)
+    except Exception:
+        return set()
 
 
-def filter_tables(t1, t2, t3):
-    # Filter Table 1 by degree type
-    t1_f = t1[t1["Predominant_Degree"].isin(KEEP_DEGREES)].copy()
-    t1_f["Category"] = t1_f.apply(assign_category, axis=1)
-
-    # Insert Category right after College_Name
-    cols = list(t1_f.columns)
-    cols.remove("Category")
-    cols.insert(cols.index("College_Name") + 1, "Category")
-    t1_f = t1_f[cols]
-    t1_f = t1_f.sort_values(["Category", "College_Name"]).reset_index(drop=True)
-
-    # Filter Tables 2 and 3 to match
-    curated_ids = set(t1_f["College_ID"].tolist())
-    t2_f = t2[t2["College_ID"].isin(curated_ids)].sort_values(["College_ID", "Year"]).reset_index(drop=True)
-    t3_f = t3[t3["College_ID"].isin(curated_ids)].sort_values(["College_ID", "Year"]).reset_index(drop=True)
-
-    return t1_f, t2_f, t3_f
-
-
-def format_sheet(ws, header_color):
-    for cell in ws[1]:
-        cell.font      = Font(bold=True, color="FFFFFF", size=10)
-        cell.fill      = PatternFill("solid", start_color=header_color)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[1].height = 30
-
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for cell in row:
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    for col_idx, col in enumerate(ws.columns, 1):
-        max_len = max((len(str(c.value)) if c.value is not None else 0) for c in col)
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 35)
-
-    ws.freeze_panes = "A2"
-
-
-def apply_category_colors(wb, t1_f, t2_f, t3_f):
-    id_to_cat = dict(zip(t1_f["College_ID"], t1_f["Category"]))
-
-    for sheet_name, df in [
-        ("Table1_Colleges",       t1_f),
-        ("Table2_Metrics_Yearly", t2_f),
-        ("Table3_Race_Diversity", t3_f),
-    ]:
-        ws     = wb[sheet_name]
-        id_col = list(df.columns).index("College_ID")
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-            cid      = row[id_col].value
-            category = id_to_cat.get(cid, "")
-            color    = CATEGORY_COLORS.get(category, "FFFFFF")
-            for cell in row:
-                cell.fill      = PatternFill("solid", start_color=color)
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-
-
-def save_curated(t1_f, t2_f, t3_f, filepath):
-    with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
-        t1_f.to_excel(writer, sheet_name="Table1_Colleges",       index=False)
-        t2_f.to_excel(writer, sheet_name="Table2_Metrics_Yearly", index=False)
-        t3_f.to_excel(writer, sheet_name="Table3_Race_Diversity", index=False)
-
-    wb = load_workbook(filepath)
-    format_sheet(wb["Table1_Colleges"],       "1F4E79")
-    format_sheet(wb["Table2_Metrics_Yearly"], "375623")
-    format_sheet(wb["Table3_Race_Diversity"], "843C0C")
-    apply_category_colors(wb, t1_f, t2_f, t3_f)
-    wb.save(filepath)
+def upsert_batch(table, records, batch_size=100):
+    for i in range(0, len(records), batch_size):
+        client.table(table).upsert(records[i:i+batch_size]).execute()
 
 
 if __name__ == "__main__":
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    input_path   = os.path.join(project_root, "data", "raw",     "houston_colleges_all.xlsx")
-    output_path  = os.path.join(project_root, "data", "curated", "houston_colleges_curated.xlsx")
+    print("Houston Edu Hub — Curated Filter")
+    print(f"Source: {SOURCE_SCHEMA}  →  Target: public\n")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    print("Reading source data...")
+    all_schools   = client.schema(SOURCE_SCHEMA).table("all_colleges").select("*").execute().data
+    all_metrics   = client.schema(SOURCE_SCHEMA).table("all_college_metrics").select("*").execute().data
+    all_diversity = client.schema(SOURCE_SCHEMA).table("all_college_diversity").select("*").execute().data
+    all_latest    = client.schema(SOURCE_SCHEMA).table("all_college_latest").select("*").execute().data
+    print(f"  {len(all_schools)} schools, {len(all_metrics)} metric rows, {len(all_diversity)} diversity rows, {len(all_latest)} latest rows")
 
-    t1, t2, t3       = load_tables(input_path)
-    t1_f, t2_f, t3_f = filter_tables(t1, t2, t3)
+    # Filter by degree type
+    filtered_schools = [s for s in all_schools if s.get("predominant_degree") in KEEP_DEGREES]
+    for s in filtered_schools:
+        s["category"] = assign_category(s)
 
-    print(f"Schools after filtering: {t1_f['College_ID'].nunique()}")
-    print()
-    for cat in ["Public University", "Community College", "Private Nonprofit", "Private For-Profit"]:
-        schools = t1_f[t1_f["Category"] == cat]["College_Name"].tolist()
-        if schools:
-            print(f"  {cat} ({len(schools)})")
-            for s in sorted(schools):
-                print(f"    - {s}")
-            print()
+    filtered_ids = {s["college_id"] for s in filtered_schools}
 
-    save_curated(t1_f, t2_f, t3_f, output_path)
-    print(f"Saved to data/curated/houston_colleges_curated.xlsx")
+    # Determine which years to load
+    years_in_target = get_years_in_target()
+    all_years       = sorted(set(m["year"] for m in all_metrics))
+    latest_year     = max(all_years) if all_years else None
+    missing_years   = [y for y in all_years if y not in years_in_target]
+    years_to_load   = sorted(set(missing_years + ([latest_year] if latest_year else []))) if years_in_target else all_years
+
+    filtered_metrics   = [m for m in all_metrics   if m.get("college_id") in filtered_ids and m.get("year") in years_to_load]
+    filtered_diversity = [d for d in all_diversity if d.get("college_id") in filtered_ids and d.get("year") in years_to_load]
+    filtered_latest    = [l for l in all_latest    if l.get("college_id") in filtered_ids]
+
+    print(f"\nAfter filtering:")
+    cats = Counter(s["category"] for s in filtered_schools)
+    for cat, count in sorted(cats.items()):
+        print(f"  {cat}: {count}")
+    print(f"  {len(filtered_metrics)} metric rows")
+    print(f"  {len(filtered_diversity)} diversity rows")
+    print(f"  {len(filtered_latest)} latest rows")
+
+    print("\nLoading into Supabase (public schema)...")
+
+    print("  colleges...")
+    upsert_batch("colleges", filtered_schools)
+
+    print("  college_metrics...")
+    upsert_batch("college_metrics", filtered_metrics)
+
+    print("  college_diversity...")
+    upsert_batch("college_diversity", filtered_diversity)
+
+    print("  college_latest...")
+    upsert_batch("college_latest", filtered_latest)
+
+    print(f"\nDone. Run collect_all_houston.py first each year, then run this script.")

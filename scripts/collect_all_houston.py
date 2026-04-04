@@ -4,22 +4,17 @@ Pulls all institutions within 75mi of Houston (ZIP 77002)
 for years 2018-2023 from the College Scorecard API
 and loads them into Supabase (houston_all schema).
 
-Auto-update logic:
-  - On first run: loads all years (2018-2023)
-  - On subsequent runs: only fetches the latest year if not already in DB
-  - Run this script once a year to keep data current
-
-Tables:
+Tables loaded:
     houston_all.all_colleges
     houston_all.all_college_metrics
     houston_all.all_college_diversity
+    houston_all.all_college_latest    ← new: latest accurate data per school
+
+Run from project root:
+    python scripts/collect_all_houston.py
 """
 
-import os
-import sys
-import math
-import requests
-import time
+import os, sys, math, requests, time
 from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,7 +23,7 @@ from supabase import create_client
 
 API_KEY       = "B2H5JoCRV54pApGF5FLvirwG3KQesLk8lilyOqts"
 BASE_URL      = "https://api.data.gov/ed/collegescorecard/v1/schools"
-ALL_YEARS     = [2018, 2019, 2020, 2021, 2022, 2023]
+YEARS         = [2018, 2019, 2020, 2021, 2022, 2023]
 HOUSTON_ZIP   = "77002"
 RADIUS        = "75mi"
 EXTRA_SCHOOLS = ["University of Houston-Victoria"]
@@ -127,6 +122,48 @@ RACE_FIELD_TEMPLATES = [
     "{year}.student.demographics.faculty.race_ethnicity.unknown",
 ]
 
+# Latest fields — uses latest.* prefix for most accurate current data
+LATEST_FIELDS = [
+    "id",
+    "latest.completion.rate_suppressed.overall",
+    "latest.student.retention_rate.four_year.full_time",
+    "latest.student.retention_rate.lt_four_year.full_time",
+    "latest.admissions.admission_rate.overall",
+    "latest.cost.avg_net_price.overall",
+    "latest.cost.tuition.in_state",
+    "latest.cost.tuition.out_of_state",
+    "latest.earnings.10_yrs_after_entry.median",
+    "latest.earnings.10_yrs_after_entry.gt_threshold",
+    "latest.aid.median_debt.completers.overall",
+    "latest.aid.median_debt.completers.monthly_payments",
+    "latest.repayment.3_yr_default_rate",
+    "latest.aid.pell_grant_rate",
+    "latest.aid.federal_loan_rate",
+    "latest.student.size",
+    "latest.student.part_time_share",
+    "latest.student.demographics.student_faculty_ratio",
+    "latest.completion.outcome_percentage_suppressed.all_students.8yr.award_pooled",
+    "latest.completion.outcome_percentage_suppressed.all_students.8yr.transfer_pooled",
+    "latest.completion.outcome_percentage_suppressed.all_students.8yr.unknown_pooled",
+    "latest.completion.outcome_percentage_suppressed.all_students.8yr.still_enrolled_pooled",
+    "latest.admissions.sat_scores.25th_percentile.critical_reading",
+    "latest.admissions.sat_scores.75th_percentile.critical_reading",
+    "latest.admissions.sat_scores.25th_percentile.math",
+    "latest.admissions.sat_scores.75th_percentile.math",
+    "latest.admissions.act_scores.25th_percentile.cumulative",
+    "latest.admissions.act_scores.75th_percentile.cumulative",
+    "latest.cost.net_price.public.by_income_level.0-30000",
+    "latest.cost.net_price.public.by_income_level.30001-48000",
+    "latest.cost.net_price.public.by_income_level.48001-75000",
+    "latest.cost.net_price.public.by_income_level.75001-110000",
+    "latest.cost.net_price.public.by_income_level.110001-plus",
+    "latest.cost.net_price.private.by_income_level.0-30000",
+    "latest.cost.net_price.private.by_income_level.30001-48000",
+    "latest.cost.net_price.private.by_income_level.48001-75000",
+    "latest.cost.net_price.private.by_income_level.75001-110000",
+    "latest.cost.net_price.private.by_income_level.110001-plus",
+]
+
 
 def build_fields(year):
     yr = str(year)
@@ -138,7 +175,6 @@ def build_fields(year):
 
 
 def get_years_in_db():
-    """Returns the set of years already loaded in the database."""
     try:
         result = client.schema(SCHEMA).table("all_college_metrics").select("year").execute()
         return set(row["year"] for row in result.data)
@@ -147,32 +183,18 @@ def get_years_in_db():
 
 
 def get_years_to_fetch():
-    """
-    Determines which years to fetch.
-    - First run: fetches all years
-    - Subsequent runs: only fetches years not already in DB
-      plus the latest year to refresh it with new data
-    """
-    years_in_db  = get_years_in_db()
-    current_year = datetime.now().year
-    latest_api_year = max(ALL_YEARS)
-
+    years_in_db    = get_years_in_db()
+    latest_yr      = max(YEARS)
     if not years_in_db:
         print("First run — fetching all years.")
-        return ALL_YEARS
-
-    missing_years = [y for y in ALL_YEARS if y not in years_in_db]
-
-    # Always re-fetch the latest year in case new data was released
-    years_to_fetch = list(set(missing_years + [latest_api_year]))
-    years_to_fetch.sort()
-
-    if years_to_fetch == [latest_api_year]:
-        print(f"Database is up to date. Refreshing latest year ({latest_api_year}).")
+        return YEARS
+    missing = [y for y in YEARS if y not in years_in_db]
+    years   = sorted(set(missing + [latest_yr]))
+    if years == [latest_yr]:
+        print(f"Database up to date. Refreshing latest year ({latest_yr}).")
     else:
-        print(f"Fetching missing years + latest refresh: {years_to_fetch}")
-
-    return years_to_fetch
+        print(f"Fetching: {years}")
+    return years
 
 
 def fetch_schools(year):
@@ -212,6 +234,53 @@ def fetch_by_name(name, year):
     if not results:
         print(f"  Warning: could not find '{name}' for {year}")
     return results
+
+
+def fetch_latest_data(college_ids):
+    """Fetch latest.* data for all schools in one API call per page."""
+    print("  Fetching latest data...", end=" ", flush=True)
+    params = {
+        "api_key":  API_KEY,
+        "zip":      HOUSTON_ZIP,
+        "distance": RADIUS,
+        "fields":   ",".join(LATEST_FIELDS),
+        "per_page": 100,
+        "page":     0,
+    }
+    all_results, total_fetched = [], 0
+    while True:
+        resp = requests.get(BASE_URL, params=params, timeout=30)
+        if resp.status_code != 200:
+            break
+        data    = resp.json()
+        results = data.get("results", [])
+        total   = data["metadata"]["total"]
+        if not results:
+            break
+        all_results.extend(results)
+        total_fetched += len(results)
+        if total_fetched >= total:
+            break
+        params["page"] += 1
+        time.sleep(0.3)
+
+    # Also fetch extra schools by name
+    for name in EXTRA_SCHOOLS:
+        ep = {
+            "api_key": API_KEY, "school.name": name,
+            "fields": ",".join(LATEST_FIELDS), "per_page": 1,
+        }
+        r = requests.get(BASE_URL, params=ep, timeout=30)
+        if r.status_code == 200:
+            res = r.json().get("results", [])
+            existing = {x.get("id") for x in all_results}
+            for s in res:
+                if s.get("id") not in existing:
+                    all_results.append(s)
+        time.sleep(0.3)
+
+    print(f"{len(all_results)} schools")
+    return {r.get("id"): r for r in all_results}
 
 
 def clean(v):
@@ -313,6 +382,55 @@ def build_diversity_record(r, year):
     }
 
 
+def build_latest_record(college_id, r):
+    pt_share = r.get("latest.student.part_time_share")
+    ft_pct   = round(1 - pt_share, 4) if pt_share is not None else None
+    pt_pct   = round(pt_share, 4)      if pt_share is not None else None
+
+    # Income breakdown — try public first, fall back to private
+    def income(bracket):
+        pub  = r.get(f"latest.cost.net_price.public.by_income_level.{bracket}")
+        priv = r.get(f"latest.cost.net_price.private.by_income_level.{bracket}")
+        return clean(pub if pub is not None else priv)
+
+    return {
+        "college_id":               college_id,
+        "graduation_rate":          clean(r.get("latest.completion.rate_suppressed.overall")),
+        "retention_rate":           clean(r.get("latest.student.retention_rate.four_year.full_time")
+                                         or r.get("latest.student.retention_rate.lt_four_year.full_time")),
+        "acceptance_rate":          clean(r.get("latest.admissions.admission_rate.overall")),
+        "net_annual_cost":          clean(r.get("latest.cost.avg_net_price.overall")),
+        "in_state_tuition":         clean(r.get("latest.cost.tuition.in_state")),
+        "out_state_tuition":        clean(r.get("latest.cost.tuition.out_of_state")),
+        "median_earnings":          clean(r.get("latest.earnings.10_yrs_after_entry.median")),
+        "pct_earning_more_than_hs": clean(r.get("latest.earnings.10_yrs_after_entry.gt_threshold")),
+        "median_debt":              clean(r.get("latest.aid.median_debt.completers.overall")),
+        "monthly_loan_payment":     clean(r.get("latest.aid.median_debt.completers.monthly_payments")),
+        "loan_default_rate":        clean(r.get("latest.repayment.3_yr_default_rate")),
+        "pell_grant_pct":           clean(r.get("latest.aid.pell_grant_rate")),
+        "federal_aid_pct":          clean(r.get("latest.aid.federal_loan_rate")),
+        "enrollment":               clean(r.get("latest.student.size")),
+        "fulltime_pct":             clean(ft_pct),
+        "parttime_pct":             clean(pt_pct),
+        "student_faculty_ratio":    clean(r.get("latest.student.demographics.student_faculty_ratio")),
+        "outcome_graduated_pct":    clean(r.get("latest.completion.outcome_percentage_suppressed.all_students.8yr.award_pooled")),
+        "outcome_transferred_pct":  clean(r.get("latest.completion.outcome_percentage_suppressed.all_students.8yr.transfer_pooled")),
+        "outcome_withdrew_pct":     clean(r.get("latest.completion.outcome_percentage_suppressed.all_students.8yr.unknown_pooled")),
+        "outcome_enrolled_pct":     clean(r.get("latest.completion.outcome_percentage_suppressed.all_students.8yr.still_enrolled_pooled")),
+        "sat_reading_25":           clean(r.get("latest.admissions.sat_scores.25th_percentile.critical_reading")),
+        "sat_reading_75":           clean(r.get("latest.admissions.sat_scores.75th_percentile.critical_reading")),
+        "sat_math_25":              clean(r.get("latest.admissions.sat_scores.25th_percentile.math")),
+        "sat_math_75":              clean(r.get("latest.admissions.sat_scores.75th_percentile.math")),
+        "act_25":                   clean(r.get("latest.admissions.act_scores.25th_percentile.cumulative")),
+        "act_75":                   clean(r.get("latest.admissions.act_scores.75th_percentile.cumulative")),
+        "cost_income_0_30k":        income("0-30000"),
+        "cost_income_30k_48k":      income("30001-48000"),
+        "cost_income_48k_75k":      income("48001-75000"),
+        "cost_income_75k_110k":     income("75001-110000"),
+        "cost_income_110k_plus":    income("110001-plus"),
+    }
+
+
 def upsert_batch(table, records, batch_size=100):
     for i in range(0, len(records), batch_size):
         client.schema(SCHEMA).table(table).upsert(records[i:i+batch_size]).execute()
@@ -338,6 +456,7 @@ if __name__ == "__main__":
 
     latest_year    = max(all_records_by_year.keys())
     latest_records = all_records_by_year[latest_year]
+    all_ids        = {r.get("id") for r in latest_records}
 
     print(f"\nLoading into Supabase ({SCHEMA} schema)...")
 
@@ -362,5 +481,12 @@ if __name__ == "__main__":
     upsert_batch("all_college_diversity", diversity_records)
     print(f"  {len(diversity_records)} rows.")
 
+    print("  all_college_latest...")
+    latest_data    = fetch_latest_data(all_ids)
+    latest_records_out = []
+    for cid, r in latest_data.items():
+        latest_records_out.append(build_latest_record(cid, r))
+    upsert_batch("all_college_latest", latest_records_out)
+    print(f"  {len(latest_records_out)} schools.")
+
     print(f"\nDone. Years loaded: {sorted(all_records_by_year.keys())}")
-    print(f"Run this script again next year to add new data automatically.")
