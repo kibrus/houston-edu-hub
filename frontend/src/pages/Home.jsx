@@ -16,6 +16,17 @@ const SORT_OPTIONS = [
 // Module-level cache — persists across navigation
 const cache = { schools: null };
 
+function hasEnoughData(latest) {
+  if (!latest) return false;
+  const fields = [
+    "graduation_rate", "retention_rate", "net_annual_cost",
+    "median_earnings", "acceptance_rate", "enrollment",
+    "median_debt", "pell_grant_pct",
+  ];
+  const filled = fields.filter((f) => latest[f] != null).length;
+  return filled / fields.length >= 0.2; // at least 20% of key fields
+}
+
 export default function Home() {
   const navigate                              = useNavigate();
   const [schools, setSchools]                 = useState(cache.schools || []);
@@ -46,10 +57,11 @@ export default function Home() {
             }
           })
         );
-        cache.schools = withLatest;
-        setSchools(withLatest);
-        setFiltered(withLatest);
-        if (withLatest.length > 0) handleSelect(withLatest[0]);
+        const enoughData = withLatest.filter((s) => hasEnoughData(s.latest));
+        cache.schools = enoughData;
+        setSchools(enoughData);
+        setFiltered(enoughData);
+        if (enoughData.length > 0) handleSelect(enoughData[0]);
       })
       .finally(() => setLoading(false));
   }, []);
