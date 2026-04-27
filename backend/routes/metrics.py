@@ -2,7 +2,13 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from flask import Blueprint, jsonify
-from config import SUPABASE_URL, SUPABASE_KEY
+import os
+from supabase import create_client
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 from supabase import create_client
 
 metrics_bp = Blueprint("metrics", __name__)
