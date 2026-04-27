@@ -2,12 +2,13 @@ services:
   - type: web
     name: houston-edu-hub-backend
     env: python
+    rootDir: .
     buildCommand: pip install -r requirements.txt
-    startCommand: cd backend && gunicorn app:app
+    startCommand: gunicorn wsgi:app
     envVars:
       - key: SUPABASE_URL
-        value: your_supabase_url
+        sync: false
       - key: SUPABASE_KEY
-        value: your_supabase_key
+        sync: false
       - key: OPENROUTER_API_KEY
-        value: your_openrouter_key
+        sync: false
