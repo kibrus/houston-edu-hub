@@ -10,10 +10,9 @@ Route:
 
 import sys, os, json, requests
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from flask import Blueprint, jsonify, request
-from config import SUPABASE_URL, SUPABASE_KEY, OPENROUTER_API_KEY
+from backend.config import SUPABASE_URL, SUPABASE_KEY, OPENROUTER_API_KEY
 from supabase import create_client
 
 chat_bp = Blueprint("chat", __name__)
