@@ -9,7 +9,8 @@ Route:
 """
 
 import json, requests
-
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from flask import Blueprint, jsonify, request
 from config import SUPABASE_URL, SUPABASE_KEY, OPENROUTER_API_KEY
