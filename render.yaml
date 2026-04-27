@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: houston-edu-hub-backend
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: cd backend && gunicorn app:app
+    envVars:
+      - key: SUPABASE_URL
+        value: your_supabase_url
+      - key: SUPABASE_KEY
+        value: your_supabase_key
+      - key: OPENROUTER_API_KEY
+        value: your_openrouter_key
