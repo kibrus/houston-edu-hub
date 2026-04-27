@@ -1,8 +1,5 @@
-import sys, os
-
-
 from flask import Blueprint, jsonify
-from backend.config import SUPABASE_URL, SUPABASE_KEY
+from config import SUPABASE_URL, SUPABASE_KEY
 from supabase import create_client
 
 metrics_bp = Blueprint("metrics", __name__)

@@ -1,8 +1,5 @@
-import sys, os
-
-
 from flask import Blueprint, jsonify, request
-from backend.config import SUPABASE_URL, SUPABASE_KEY
+from config import SUPABASE_URL, SUPABASE_KEY
 from supabase import create_client
 
 schools_bp = Blueprint("schools", __name__)
