@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { getAllSchools, getLatest } from "../services/api";
-import SchoolList    from "../components/SchoolList";
-import SchoolPreview from "../components/SchoolPreview";
+import SchoolList     from "../components/SchoolList";
+import SchoolPreview  from "../components/SchoolPreview";
+import LoadingSpinner from "../components/LoadingSpinner";
+import ErrorMessage   from "../components/ErrorMessage";
 
 const CATEGORIES = ["All", "Public University", "Community College", "Private Nonprofit", "Private For-Profit"];
 const SORT_OPTIONS = [
@@ -13,7 +15,6 @@ const SORT_OPTIONS = [
   { label: "Enrollment",      key: "enrollment",      dir: "desc" },
 ];
 
-// Module-level cache — persists across navigation
 const cache = { schools: null };
 
 function hasEnoughData(latest) {
@@ -24,27 +25,33 @@ function hasEnoughData(latest) {
     "median_debt", "pell_grant_pct",
   ];
   const filled = fields.filter((f) => latest[f] != null).length;
-  return filled / fields.length >= 0.2; // at least 20% of key fields
+  return filled / fields.length >= 0.4;
 }
 
 export default function Home() {
-  const navigate                              = useNavigate();
-  const [schools, setSchools]                 = useState(cache.schools || []);
-  const [filtered, setFiltered]               = useState(cache.schools || []);
-  const [selected, setSelected]               = useState(null);
-  const [selectedLatest, setSelectedLatest]   = useState(null);
-  const [compareIds, setCompareIds]           = useState([]);
-  const [search, setSearch]                   = useState("");
-  const [category, setCategory]               = useState("All");
-  const [sortIdx, setSortIdx]                 = useState(0);
-  const [loading, setLoading]                 = useState(!cache.schools);
+  const navigate                            = useNavigate();
+  const [schools, setSchools]               = useState(cache.schools || []);
+  const [filtered, setFiltered]             = useState(cache.schools || []);
+  const [selected, setSelected]             = useState(null);
+  const [selectedLatest, setSelectedLatest] = useState(null);
+  const [compareIds, setCompareIds]         = useState([]);
+  const [search, setSearch]                 = useState("");
+  const [category, setCategory]             = useState("All");
+  const [sortIdx, setSortIdx]               = useState(0);
+  const [loading, setLoading]               = useState(!cache.schools);
+  const [error, setError]                   = useState(null);
+  const [sidebarOpen, setSidebarOpen]       = useState(false);
+  const [isMobile, setIsMobile]             = useState(window.innerWidth < 768);
 
   useEffect(() => {
-    if (cache.schools) {
-      if (!selected && cache.schools.length > 0) handleSelect(cache.schools[0]);
-      return;
-    }
+    const handleResize = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  const loadSchools = () => {
     setLoading(true);
+    setError(null);
     getAllSchools()
       .then(async (data) => {
         const withLatest = await Promise.all(
@@ -63,7 +70,16 @@ export default function Home() {
         setFiltered(enoughData);
         if (enoughData.length > 0) handleSelect(enoughData[0]);
       })
+      .catch(() => setError("Failed to load institutions. Please check your connection and try again."))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    if (cache.schools) {
+      if (!selected && cache.schools.length > 0) handleSelect(cache.schools[0]);
+      return;
+    }
+    loadSchools();
   }, []);
 
   useEffect(() => {
@@ -86,10 +102,11 @@ export default function Home() {
     setFiltered(result);
   }, [schools, search, category, sortIdx]);
 
-  const handleSelect = useCallback(async (school) => {
+  const handleSelect = useCallback((school) => {
     setSelected(school);
     setSelectedLatest(school.latest || {});
-  }, []);
+    if (isMobile) setSidebarOpen(false);
+  }, [isMobile]);
 
   const handleAddToCompare = (id) => {
     setCompareIds((prev) => {
@@ -101,52 +118,230 @@ export default function Home() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 58px)" }}>
+
       {/* Search bar */}
-      <div style={{ background: "var(--color-dark)", padding: "1rem 2rem", display: "flex", gap: "0.75rem", alignItems: "center", borderTop: "1px solid #1C2E42" }}>
+      <div style={{
+        background: "var(--color-dark)",
+        padding:    isMobile ? "0.75rem 1rem" : "1rem 2rem",
+        display:    "flex",
+        gap:        "0.5rem",
+        alignItems: "center",
+        flexWrap:   isMobile ? "wrap" : "nowrap",
+        borderTop:  "1px solid #1C2E42",
+        flexShrink: 0,
+      }}>
+        {/* Hamburger toggle on mobile */}
+        {isMobile && (
+          <button
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            style={{
+              background:   "var(--color-gold)",
+              border:       "none",
+              borderRadius: "var(--radius-sm)",
+              padding:      "0.5rem 0.75rem",
+              color:        "var(--color-dark)",
+              fontSize:     "18px",
+              cursor:       "pointer",
+              flexShrink:   0,
+              lineHeight:   1,
+            }}
+          >
+            ☰
+          </button>
+        )}
+
         <input
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           placeholder="Search by school name..."
-          style={{ background: "#F8FAFC", border: "1px solid #2A3D54", borderRadius: "var(--radius-sm)", padding: "0.55rem 1rem", fontSize: "14px", color: "var(--color-text)", width: "300px" }}
+          style={{
+            background:   "#F8FAFC",
+            border:       "1px solid #2A3D54",
+            borderRadius: "var(--radius-sm)",
+            padding:      "0.5rem 0.85rem",
+            fontSize:     "14px",
+            color:        "var(--color-text)",
+            flex:         isMobile ? "1" : "0 0 300px",
+            minWidth:     "0",
+          }}
         />
-        <select value={category} onChange={(e) => setCategory(e.target.value)}
-          style={{ background: "#1C2E42", border: "1px solid #2A3D54", borderRadius: "var(--radius-sm)", padding: "0.55rem 1rem", fontSize: "13px", color: "#CBD5E1" }}>
+
+        <select
+          value={category}
+          onChange={(e) => setCategory(e.target.value)}
+          style={{
+            background:   "#1C2E42",
+            border:       "1px solid #2A3D54",
+            borderRadius: "var(--radius-sm)",
+            padding:      "0.5rem 0.75rem",
+            fontSize:     "12px",
+            color:        "#CBD5E1",
+            flex:         isMobile ? "1" : "0 0 auto",
+          }}
+        >
           {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
         </select>
-        <span style={{ color: "#64748B", fontSize: "13px", marginLeft: "auto" }}>{filtered.length} institutions</span>
-        <select value={sortIdx} onChange={(e) => setSortIdx(Number(e.target.value))}
-          style={{ background: "var(--color-white)", border: "1px solid var(--color-border)", borderRadius: "var(--radius-sm)", padding: "0.45rem 0.75rem", fontSize: "13px", color: "var(--color-text)" }}>
-          {SORT_OPTIONS.map((o, i) => <option key={o.key} value={i}>Sort: {o.label}</option>)}
-        </select>
-      </div>
 
-      {/* Split panel */}
-      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
-        {loading ? (
-          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: "0.75rem", color: "var(--color-text-muted)" }}>
-            <div style={{ fontSize: "24px" }}>🎓</div>
-            <div>Loading institutions...</div>
-          </div>
-        ) : (
+        {!isMobile && (
           <>
-            <SchoolList schools={filtered} selectedId={selected?.college_id} onSelect={handleSelect} />
-            <SchoolPreview school={selected} latest={selectedLatest} onAddToCompare={handleAddToCompare} compareIds={compareIds} />
+            <span style={{ color: "#64748B", fontSize: "13px", marginLeft: "auto" }}>
+              {loading ? "Loading..." : `${filtered.length} institutions`}
+            </span>
+            <select
+              value={sortIdx}
+              onChange={(e) => setSortIdx(Number(e.target.value))}
+              style={{
+                background:   "var(--color-white)",
+                border:       "1px solid var(--color-border)",
+                borderRadius: "var(--radius-sm)",
+                padding:      "0.45rem 0.75rem",
+                fontSize:     "13px",
+                color:        "var(--color-text)",
+              }}
+            >
+              {SORT_OPTIONS.map((o, i) => <option key={o.key} value={i}>Sort: {o.label}</option>)}
+            </select>
           </>
         )}
+
+        {isMobile && (
+          <select
+            value={sortIdx}
+            onChange={(e) => setSortIdx(Number(e.target.value))}
+            style={{
+              background:   "#1C2E42",
+              border:       "1px solid #2A3D54",
+              borderRadius: "var(--radius-sm)",
+              padding:      "0.5rem 0.6rem",
+              fontSize:     "12px",
+              color:        "#CBD5E1",
+              flex:         "1",
+            }}
+          >
+            {SORT_OPTIONS.map((o, i) => <option key={o.key} value={i}>Sort: {o.label}</option>)}
+          </select>
+        )}
+      </div>
+
+      {/* Body */}
+      <div style={{ display: "flex", flex: 1, overflow: "hidden", position: "relative" }}>
+
+        {/* Dark overlay when sidebar open on mobile */}
+        {isMobile && sidebarOpen && (
+          <div
+            onClick={() => setSidebarOpen(false)}
+            style={{
+              position:   "fixed",
+              inset:      0,
+              top:        "58px",
+              background: "rgba(0,0,0,0.5)",
+              zIndex:     49,
+            }}
+          />
+        )}
+
+        {/* School list */}
+        {(!isMobile || sidebarOpen) && (
+          <div style={{
+            position:   isMobile ? "fixed" : "relative",
+            top:        isMobile ? "58px" : "auto",
+            left:       0,
+            bottom:     0,
+            zIndex:     isMobile ? 50 : "auto",
+            width:      isMobile ? "280px" : "auto",
+            boxShadow:  isMobile ? "4px 0 16px rgba(0,0,0,0.25)" : "none",
+            height:     isMobile ? "auto" : "100%",
+            overflowY:  "auto",
+          }}>
+            {isMobile && (
+              <div style={{ background: "var(--color-dark)", padding: "0.75rem 1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ color: "#fff", fontSize: "13px", fontWeight: "500" }}>
+                  {filtered.length} Institutions
+                </span>
+                <button
+                  onClick={() => setSidebarOpen(false)}
+                  style={{ background: "transparent", border: "none", color: "#64748B", fontSize: "20px", cursor: "pointer" }}
+                >×</button>
+              </div>
+            )}
+
+            {loading ? (
+              <LoadingSpinner message="Loading..." />
+            ) : error ? (
+              <ErrorMessage message={error} onRetry={() => { cache.schools = null; loadSchools(); }} />
+            ) : filtered.length === 0 ? (
+              <div style={{ padding: "2rem", textAlign: "center", color: "var(--color-text-muted)" }}>
+                <div style={{ fontSize: "24px", marginBottom: "0.5rem" }}>🔍</div>
+                <div style={{ fontSize: "13px" }}>No institutions found.</div>
+                <button
+                  onClick={() => { setSearch(""); setCategory("All"); }}
+                  style={{ marginTop: "0.75rem", background: "var(--color-gold)", color: "var(--color-dark)", border: "none", borderRadius: "var(--radius-sm)", padding: "6px 14px", fontSize: "12px", cursor: "pointer" }}
+                >
+                  Clear Filters
+                </button>
+              </div>
+            ) : (
+              <SchoolList
+                schools={filtered}
+                selectedId={selected?.college_id}
+                onSelect={handleSelect}
+              />
+            )}
+          </div>
+        )}
+
+        {/* School preview — full width on mobile */}
+        <div style={{ flex: 1, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+          {loading && !isMobile ? (
+            <LoadingSpinner message="Loading Houston-area institutions..." />
+          ) : error && !isMobile ? (
+            <ErrorMessage message={error} onRetry={() => { cache.schools = null; loadSchools(); }} />
+          ) : (
+            <SchoolPreview
+              school={selected}
+              latest={selectedLatest}
+              onAddToCompare={handleAddToCompare}
+              compareIds={compareIds}
+            />
+          )}
+        </div>
       </div>
 
       {/* Compare bar */}
       {compareIds.length > 0 && (
-        <div style={{ background: "var(--color-dark)", padding: "0.75rem 2rem", display: "flex", alignItems: "center", gap: "1rem", borderTop: "1px solid #1C2E42" }}>
-          <span style={{ color: "#94A3B8", fontSize: "13px" }}>Ready to Compare:</span>
-          <span style={{ background: "var(--color-gold)", color: "var(--color-dark)", borderRadius: "50%", width: "20px", height: "20px", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: "11px", fontWeight: "600" }}>
-            {compareIds.length}
-          </span>
-          <span style={{ color: "#94A3B8", fontSize: "13px" }}>{compareIds.length === 1 ? "school selected" : "schools selected"}</span>
-          <button onClick={() => navigate(`/compare?ids=${compareIds.join(",")}`)} style={{ background: "var(--color-gold)", color: "var(--color-dark)", border: "none", borderRadius: "var(--radius-sm)", padding: "7px 18px", fontSize: "13px", fontWeight: "500" }}>
+        <div style={{
+          background: "var(--color-dark)",
+          padding:    isMobile ? "0.65rem 1rem" : "0.75rem 2rem",
+          display:    "flex",
+          alignItems: "center",
+          gap:        "0.75rem",
+          borderTop:  "1px solid #1C2E42",
+          flexShrink: 0,
+          flexWrap:   "wrap",
+        }}>
+          <span style={{ color: "#94A3B8", fontSize: "13px" }}>Compare:</span>
+          <span style={{
+            background:    "var(--color-gold)",
+            color:         "var(--color-dark)",
+            borderRadius:  "50%",
+            width:         "20px",
+            height:        "20px",
+            display:       "inline-flex",
+            alignItems:    "center",
+            justifyContent:"center",
+            fontSize:      "11px",
+            fontWeight:    "600",
+          }}>{compareIds.length}</span>
+          <button
+            onClick={() => navigate(`/compare?ids=${compareIds.join(",")}`)}
+            style={{ background: "var(--color-gold)", color: "var(--color-dark)", border: "none", borderRadius: "var(--radius-sm)", padding: "7px 16px", fontSize: "13px", fontWeight: "500", cursor: "pointer" }}
+          >
             Compare Now
           </button>
-          <button onClick={() => setCompareIds([])} style={{ background: "transparent", color: "#64748B", border: "1px solid #2A3D54", borderRadius: "var(--radius-sm)", padding: "7px 14px", fontSize: "13px" }}>
+          <button
+            onClick={() => setCompareIds([])}
+            style={{ background: "transparent", color: "#64748B", border: "1px solid #2A3D54", borderRadius: "var(--radius-sm)", padding: "7px 12px", fontSize: "13px", cursor: "pointer" }}
+          >
             Clear
           </button>
         </div>
